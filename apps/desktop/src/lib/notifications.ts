@@ -152,6 +152,71 @@ async function playBuiltinAudio(volume: number): Promise<void> {
   }
 }
 
+/** Magazine-rack whoosh + click when a ramble clip lands in the strip. */
+export async function playClipRackSound(volume = 80): Promise<void> {
+  const context = await resolveAudioContext()
+  if (!context) return
+  try {
+    const now = context.currentTime
+    const normalizedVolume = Math.min(100, Math.max(0, volume)) / 100
+    const master = context.createGain()
+    master.gain.setValueAtTime(Math.max(0.0001, 0.18 * normalizedVolume), now)
+    master.connect(context.destination)
+
+    const whoosh = context.createOscillator()
+    whoosh.type = 'triangle'
+    whoosh.frequency.setValueAtTime(420, now)
+    whoosh.frequency.exponentialRampToValueAtTime(140, now + 0.28)
+    const whooshGain = context.createGain()
+    whooshGain.gain.setValueAtTime(0.0001, now)
+    whooshGain.gain.exponentialRampToValueAtTime(0.9, now + 0.04)
+    whooshGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32)
+    whoosh.connect(whooshGain)
+    whooshGain.connect(master)
+    whoosh.start(now)
+    whoosh.stop(now + 0.34)
+
+    const click = context.createOscillator()
+    click.type = 'square'
+    click.frequency.setValueAtTime(1680, now + 0.3)
+    click.frequency.exponentialRampToValueAtTime(220, now + 0.42)
+    const clickGain = context.createGain()
+    clickGain.gain.setValueAtTime(0.0001, now + 0.3)
+    clickGain.gain.exponentialRampToValueAtTime(1, now + 0.312)
+    clickGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.46)
+    click.connect(clickGain)
+    clickGain.connect(master)
+    click.start(now + 0.3)
+    click.stop(now + 0.48)
+  } catch {
+    // Interaction audio is optional.
+  }
+}
+
+/** Short arming tick when recording starts. */
+export async function playRecordArmSound(volume = 80): Promise<void> {
+  const context = await resolveAudioContext()
+  if (!context) return
+  try {
+    const now = context.currentTime
+    const normalizedVolume = Math.min(100, Math.max(0, volume)) / 100
+    const osc = context.createOscillator()
+    osc.type = 'sine'
+    osc.frequency.setValueAtTime(1560, now)
+    osc.frequency.exponentialRampToValueAtTime(880, now + 0.07)
+    const gain = context.createGain()
+    gain.gain.setValueAtTime(0.0001, now)
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, 0.42 * normalizedVolume), now + 0.008)
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09)
+    osc.connect(gain)
+    gain.connect(context.destination)
+    osc.start(now)
+    osc.stop(now + 0.1)
+  } catch {
+    // Interaction audio is optional.
+  }
+}
+
 export async function playNotificationSound(
   sound: NotificationSound = 'chime',
   volume = 80,

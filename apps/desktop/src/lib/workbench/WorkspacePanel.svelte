@@ -12,12 +12,14 @@
   import { locale } from '$lib/preferences'
   import { savePaneLayout, savedPaneLayout } from '$lib/uiPreferences'
   import type {
+    BriefNotePhase,
     FeedbackEditorHandle,
     HostProfile,
     RamblePhase,
     SavePhase,
     SubmitStage,
   } from './types'
+  import type { RambleClip } from './briefNotes'
   import CommandRail from './CommandRail.svelte'
   import FeedbackEditorPanel from './FeedbackEditorPanel.svelte'
   import RequestAttachmentPreview from './RequestAttachmentPreview.svelte'
@@ -40,6 +42,17 @@
   export let ramblePhase: RamblePhase = 'idle'
   export let rambleBusy = false
   export let rambleStartedOnce = false
+  export let rambleClips: RambleClip[] = []
+  export let briefNoteProcessingIds: string[] = []
+  export let noteTranscript = ''
+  /** A confirmed terminal action is draining captures; editing would be lost. */
+  export let terminalPending = false
+  export let briefNotes: Record<string, string[]> = {}
+  export let briefNotePhase: BriefNotePhase = 'idle'
+  export let briefNoteBlockId: string | null = null
+  export let onToggleBriefNote: (blockId: string) => void = () => {}
+  export let onSaveRambleClip: (clipId: string, text: string) => void = () => {}
+  export let onSaveBriefNote: (blockId: string, index: number, text: string) => void = () => {}
   export let voiceDevice = ''
   export let voiceChunkIndex = 0
   export let voicePartial = ''
@@ -58,6 +71,7 @@
   export let canCancel = false
   export let cancelling = false
   export let approving = false
+  export let noteBusy = false
   export let canOpenResumePrompt = false
   export let resolveHostProfile: (hostId: string) => HostProfile
   export let formatTime: (value: string | null | undefined) => string
@@ -115,7 +129,7 @@
     taskBriefPreviewOrigin = null
     taskBriefPreviewOpen = true
   }
-  $: interactionLocked = cooking || submitting || cancelling || approving
+  $: interactionLocked = cooking || submitting || cancelling || approving || terminalPending
   // Nudge the preview button when the full-screen brief collapses back to it.
   $: {
     const nowOpen = taskBriefPreviewOpen
@@ -281,6 +295,7 @@
         {canCancel}
         {cancelling}
         {approving}
+        {noteBusy}
         {canOpenResumePrompt}
         {onToggleRamble}
         {onExitRamble}
@@ -315,6 +330,16 @@
       {ramblePhase}
       {rambleStartedOnce}
       {rambleBusy}
+      {rambleClips}
+      {briefNotes}
+      {briefNotePhase}
+      {briefNoteBlockId}
+      {briefNoteProcessingIds}
+      {noteTranscript}
+      {interactionLocked}
+      {onToggleBriefNote}
+      {onSaveRambleClip}
+      {onSaveBriefNote}
       origin={taskBriefPreviewOrigin}
     />
   {:else}

@@ -64,7 +64,26 @@
     type AttachmentMessageTone,
   } from './lib/workbench/attachmentController'
   import { createNavigationController } from './lib/workbench/navigationController'
+  import {
+    appendBlockNote,
+    appendRambleClip,
+    briefBlocks,
+    capturedTranscriptMarkdown,
+    findBriefBlock,
+    quotedNoteMarkdown,
+    replaceBlockNote,
+    replaceCapture,
+    replaceNthBlock,
+    replaceRambleClip,
+    sameCaptureOccurrence,
+    upsertCapture,
+    wrapCapture,
+    parseCaptures,
+    blockNoteCaptureId,
+    type RambleClip,
+  } from './lib/workbench/briefNotes'
   import type {
+    BriefNotePhase,
     FeedbackEditorHandle,
     RamblePhase,
     RambleSessionControllerHandle,
@@ -136,6 +155,13 @@
   let dragActive = false
   let workspacePanel: FeedbackEditorHandle
   let rambleController: RambleSessionControllerHandle
+  let rambleClipsByRequest: Record<string, RambleClip[]> = {}
+  let briefNotesByRequest: Record<string, Record<string, string[]>> = {}
+  let briefNotePhase: BriefNotePhase = 'idle'
+  let briefNoteBlockId: string | null = null
+  let briefNoteProcessing: Array<{ requestId: string; blockId: string }> = []
+  let briefNoteRequestId = ''
+  let voiceNoteTranscript = ''
   let resumePrompt: ResumePrompt | null = null
   let resumeCopyState: 'idle' | 'copied' | 'failed' = 'idle'
   let notificationState: NotificationState = 'checking'
@@ -327,14 +353,24 @@
     draftBody.trim().length > 0 &&
     !currentRequestCooking &&
     !submitting &&
-    !cancelling
+    !cancelling &&
+    !approving &&
+    currentNotePhase !== 'starting' &&
+    !captureInFlight
   $: canCancel =
     workspace !== null &&
     workspace.request.status !== 'completed' &&
     workspace.request.status !== 'cancelled' &&
     !currentRequestCooking &&
     !submitting &&
-    !cancelling
+    !cancelling &&
+    !approving &&
+    currentNotePhase !== 'starting' &&
+    !captureInFlight
+  // Note recording deliberately stays out of this: the note write itself goes
+  // through updateDraft, and a refused write is silently reverted when the
+  // editor re-syncs from draftBody. Submit and cancel keep their own note
+  // guards.
   $: interactionLocked = submitting || cancelling || approving
   $: voiceActive =
     voicePhase === 'starting' ||
@@ -347,6 +383,26 @@
   $: rambleEngaged = ramblePhase !== 'idle'
   $: rambleBelongsToWorkspace =
     !rambleEngaged || workspace?.request.request_id === rambleRequestId
+  $: currentRambleClips = workspace
+    ? rambleClipsByRequest[workspace.request.request_id] ?? []
+    : []
+  // A note recorded against another request must not surface on this one: block
+  // ids like `what_happened:0` are shared, so the live transcript and the
+  // recording control would attach themselves to an unrelated block.
+  $: briefNoteBelongsToWorkspace =
+    briefNoteRequestId !== '' && briefNoteRequestId === workspace?.request.request_id
+  $: currentNotePhase = briefNoteBelongsToWorkspace ? briefNotePhase : 'idle'
+  $: currentNoteBlockId = briefNoteBelongsToWorkspace ? briefNoteBlockId : null
+  $: currentNoteProcessingIds = workspace
+    ? briefNoteProcessing
+        .filter((item) => item.requestId === workspace?.request.request_id)
+        .map((item) => item.blockId)
+    : []
+  $: captureInFlight =
+    currentNoteProcessingIds.length > 0 || currentRambleClips.some((clip) => clip.processing)
+  $: currentBriefNotes = workspace
+    ? briefNotesByRequest[workspace.request.request_id] ?? {}
+    : {}
   $: rambelleStatusPortrait = feedbackResult
     ? rambelleArchived
     : currentRequestCooking
@@ -422,6 +478,7 @@
         savedBody = draftBody
         savedRevision = previewFixtures.workspace.draft.saved_revision
         savePhase = 'saved'
+        applyCapturesFromBody(workspace.request.request_id, draftBody)
         if (new URLSearchParams(window.location.search).get('dialog') === 'resume') {
           resumePrompt = previewFixtures.resumePrompt
         }
@@ -552,10 +609,26 @@
     }
   }
 
+  function applyCapturesFromBody(requestId: string, body: string) {
+    const parsedCaptures = parseCaptures(body)
+    rambleClipsByRequest = {
+      ...rambleClipsByRequest,
+      [requestId]: parsedCaptures.clips,
+    }
+    briefNotesByRequest = {
+      ...briefNotesByRequest,
+      [requestId]: parsedCaptures.notes,
+    }
+  }
+
   async function openRequest(requestId: string, saveCurrent = true) {
-    if (interactionLocked || workspace?.request.request_id === requestId) return
+    if (interactionLocked || terminalPending || workspace?.request.request_id === requestId) return
     if (saveCurrent && !(await saveDraftNow())) return
-    if (requestId === rambleRequestId) await rambleMarkdownQueue.catch(() => {})
+    // Always drain, not just when this is the ramble's own request: a capture
+    // for any request can be queued now that cleanup outlives the recording it
+    // came from, and loading over an unfinished write hydrates a stale body and
+    // leaves later edits on a dead revision.
+    await rambleMarkdownQueue.catch(() => {})
 
     loadingWorkspace = true
     pageError = ''
@@ -573,6 +646,7 @@
       cookedPreviewOriginal = ''
       draftBody = next.draft.body_markdown
       savedBody = next.draft.body_markdown
+      applyCapturesFromBody(next.request.request_id, next.draft.body_markdown)
       savedRevision = next.draft.saved_revision
       savePhase = next.draft.updated_at ? 'saved' : 'idle'
       saveMessage = ''
@@ -597,15 +671,25 @@
     }
   }
 
-  async function appendRambleMarkdown(requestId: string, markdown: string): Promise<void> {
-    if (interactionLocked) return
+  async function appendRambleMarkdown(
+    requestId: string,
+    markdown: string,
+    capture?: { id: string; inner: string },
+  ): Promise<void> {
     const block = markdown.trim()
     if (!requestId || !block) return
+    const merge = (body: string) =>
+      capture ? upsertCapture(body, capture.id, capture.inner) : appendMarkdownBlock(body, block)
 
     const operation = rambleMarkdownQueue.then(async () => {
+      // The interaction lock belongs to the visible workspace's draft. A capture
+      // routed to a different request writes straight through save_feedback_draft
+      // and must not be dropped because this workspace happens to be busy.
       if (workspace?.request.request_id === requestId) {
-        const nextBody = appendMarkdownBlock(draftBody, block)
-        updateDraft(nextBody)
+        if (interactionLocked) {
+          throw new Error(saveMessage || tr('The current draft could not be saved.'))
+        }
+        updateDraft(merge(draftBody))
         if (!(await saveDraftNow())) throw new Error(saveMessage || tr('The current draft could not be saved.'))
         return
       }
@@ -616,7 +700,7 @@
       if (!target) throw new Error(tr('This feedback request could not be found.'))
       const input: SaveDraftInput = {
         request_id: requestId,
-        body_markdown: appendMarkdownBlock(target.draft.body_markdown, block),
+        body_markdown: merge(target.draft.body_markdown),
         expected_revision: target.draft.saved_revision,
       }
       if (!previewMode) await invoke<DraftView>('save_feedback_draft', { input })
@@ -724,7 +808,17 @@
     },
     getPreviewOriginal: () => cookedPreviewOriginal,
   })
-  const cookPreviewOnly = cookingController.cookPreviewOnly
+  const cookPreviewOnlyNow = cookingController.cookPreviewOnly
+
+  /**
+   * Cooking snapshots the draft, so a capture that lands while the model call
+   * is pending would be overwritten by the stale cooked result. Every cooking
+   * entry point goes through here.
+   */
+  async function cookPreviewOnly() {
+    if (!(await awaitLandingCaptures())) return
+    await cookPreviewOnlyNow()
+  }
   const restoreOriginalAfterCook = cookingController.restoreOriginal
 
   const publisherController = createPublisherController({
@@ -750,6 +844,14 @@
     getCanSubmit: () => canSubmit,
     getRambleCanExit: () => rambleCanExit,
     exitRamble,
+    awaitCaptureWork: awaitCaptureWrites,
+    canStartTerminal: () => !terminalPending,
+    lockTerminal: () => {
+      terminalLocks += 1
+    },
+    unlockTerminal: () => {
+      terminalLocks = Math.max(0, terminalLocks - 1)
+    },
     saveDraftNow,
     getDraftBody: () => draftBody,
     getSavedRevision: () => savedRevision,
@@ -776,13 +878,26 @@
   const submitFeedback = publisherController.submitFeedback
 
   async function approveFeedback() {
-    if (!workspace || !workspace.request.allow_finish || approving) return
+    if (!workspace || !workspace.request.allow_finish || approving || interactionLocked) return
+    if (captureInFlight || terminalPending) return
     if (!window.confirm(tr('Approve this final summary and end Pi’s Ramble flow?'))) return
-    if (rambleCanExit) await exitRamble()
+    // Pin the request the operator confirmed: the wait below is long enough to
+    // navigate away, and the action must not land on whatever is visible then.
+    const requestId = workspace.request.request_id
+    terminalLocks += 1
+    try {
+      if (rambleCanExit) await exitRamble()
+      // Approving makes the request terminal and the draft controller then
+      // refuses saves, so anything still being transcribed has to land first.
+      if (!(await awaitCaptureWrites())) return
+    } finally {
+      terminalLocks = Math.max(0, terminalLocks - 1)
+    }
+    if (workspace?.request.request_id !== requestId || approving || cancelling) return
     approving = true
     pageError = ''
     try {
-      const input: ApproveFeedbackInput = { request_id: workspace.request.request_id }
+      const input: ApproveFeedbackInput = { request_id: requestId }
       const result = await invoke<FeedbackRequestView>('approve_feedback_request', { input })
       completedResult = result
       workspace = {
@@ -804,14 +919,22 @@
   }
 
   async function cancelFeedback() {
-    if (!workspace || !canCancel) return
-    if (rambleCanExit) await exitRamble()
+    if (!workspace || !canCancel || terminalPending) return
+    const requestId = workspace.request.request_id
+    terminalLocks += 1
+    try {
+      if (rambleCanExit) await exitRamble()
+      if (!(await awaitCaptureWrites())) return
+    } finally {
+      terminalLocks = Math.max(0, terminalLocks - 1)
+    }
+    if (workspace?.request.request_id !== requestId || cancelling || approving) return
 
     cancelling = true
     pageError = ''
     try {
       const input: CancelFeedbackInput = {
-        request_id: workspace.request.request_id,
+        request_id: requestId,
         reason: 'Human cancelled from RambleDesk desktop',
       }
       const result = await invoke<FeedbackRequestView>('cancel_feedback_request', { input })
@@ -854,6 +977,284 @@
     await rambleController?.toggleRamble()
   }
 
+  async function toggleBriefNote(blockId: string) {
+    await rambleController?.toggleBriefNote(blockId)
+  }
+
+  /**
+   * Move the draft to `next`. The draft is written first on purpose: the editor
+   * re-syncs from `draftBody`, so pushing markdown into the editor before a
+   * refused `updateDraft` would show the text and then silently revert it.
+   * Returns false when the draft refused the write.
+   */
+  function applyDraftBody(next: string): boolean {
+    if (next === draftBody) return true
+    updateDraft(next)
+    if (draftBody !== next) return false
+    workspacePanel?.applyExternalMarkdown(next)
+    return true
+  }
+
+  /**
+   * Persistence of captures. Terminal actions await this after the controller's
+   * cleanup chain, since that chain only reaches the point where a write was
+   * issued, not the point where it landed in the store.
+   */
+  let captureSaves: Promise<void> = Promise.resolve()
+  /**
+   * Capture writes that did not persist, kept with the request they belong to.
+   * A bare failure flag was not enough: retrying it saved whichever request
+   * happened to be visible, which trivially succeeds for a clean draft and
+   * cleared the flag while the real capture was still only in memory.
+   */
+  let failedCaptureWrites: Array<{ requestId: string; captureId: string; inner: string }> = []
+  /**
+   * Depth of terminal/snapshot drains in progress. Counted so the wait helpers
+   * can hold it themselves — leaving it to each call site is what let submission
+   * drain without it. It deliberately stays out of App's interactionLocked,
+   * which also refuses the very draft writes the drain is waiting for; instead
+   * it holds navigation, the delivery actions, and editing.
+   */
+  let terminalLocks = 0
+  $: terminalPending = terminalLocks > 0
+
+  function trackCaptureSave(work: Promise<unknown>) {
+    captureSaves = Promise.allSettled([captureSaves, work]).then(() => undefined)
+  }
+
+  /**
+   * Write one capture into the request it belongs to and persist it. Routes by
+   * request id, so a capture that finished after the operator navigated away
+   * still lands in its own draft.
+   */
+  async function persistCapture(
+    requestId: string,
+    captureId: string,
+    inner: string,
+  ): Promise<boolean> {
+    if (workspace?.request.request_id === requestId) {
+      if (applyDraftBody(upsertCapture(draftBody, captureId, inner))) {
+        mirrorIntoCookedOriginal((body) => upsertCapture(body, captureId, inner))
+        return await saveDraftNow()
+      }
+    }
+    try {
+      await appendRambleMarkdown(requestId, wrapCapture(captureId, inner), {
+        id: captureId,
+        inner,
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function recordFailedCapture(write: { requestId: string; captureId: string; inner: string }) {
+    failedCaptureWrites = [...withoutCapture(write.requestId, write.captureId), write]
+  }
+
+  /**
+   * A later write to the same capture supersedes an earlier failure. Without
+   * this the stale text would be retried on the next drain and overwrite the
+   * newer content that did persist.
+   */
+  function clearFailedCapture(requestId: string, captureId: string) {
+    failedCaptureWrites = withoutCapture(requestId, captureId)
+  }
+
+  function withoutCapture(requestId: string, captureId: string) {
+    return failedCaptureWrites.filter(
+      (item) => item.requestId !== requestId || item.captureId !== captureId,
+    )
+  }
+
+  /**
+   * Wait for every capture to be cleaned up, written, and persisted. Returns
+   * false when one of them is still unsaved, in which case the caller must not
+   * make the request terminal. Capture entry stays locked across the whole
+   * wait, persistence included — releasing it after cleanup let a fresh
+   * recording start behind an already-snapshotted save chain.
+   */
+  async function awaitCaptureWrites(): Promise<boolean> {
+    return drainCaptures(() => rambleController?.awaitCaptureWork())
+  }
+
+  /** As above, but never stops a note the operator is still recording. */
+  async function awaitLandingCaptures(): Promise<boolean> {
+    return drainCaptures(() => rambleController?.awaitPendingCaptures())
+  }
+
+  async function drainCaptures(wait: () => Promise<void> | undefined): Promise<boolean> {
+    terminalLocks += 1
+    rambleController?.lockCaptureEntry()
+    try {
+      await wait()
+      return await settleCaptureSaves()
+    } finally {
+      rambleController?.unlockCaptureEntry()
+      terminalLocks = Math.max(0, terminalLocks - 1)
+    }
+  }
+
+  async function settleCaptureSaves(): Promise<boolean> {
+    await captureSaves
+    if (failedCaptureWrites.length === 0) return true
+    // Retry the writes that actually failed, against their own requests. Only
+    // the ones that land are cleared.
+    const pending = failedCaptureWrites
+    failedCaptureWrites = []
+    for (const write of pending) {
+      if (!(await persistCapture(write.requestId, write.captureId, write.inner))) {
+        recordFailedCapture(write)
+      }
+    }
+    if (failedCaptureWrites.length === 0) return true
+    pageError = saveMessage || tr('The current draft could not be saved.')
+    return false
+  }
+
+  /**
+   * The cooked preview keeps a pre-cook snapshot that "Restore original"
+   * reinstates and submission publishes as uncooked.md. A capture landing after
+   * cooking has to reach that snapshot as well, or restoring deletes the new
+   * recording and the audit source omits it.
+   */
+  function mirrorIntoCookedOriginal(apply: (body: string) => string) {
+    if (cookedPreviewOriginal) cookedPreviewOriginal = apply(cookedPreviewOriginal)
+    if (cookedPreview) cookedPreview = { ...cookedPreview, original: apply(cookedPreview.original) }
+  }
+
+  /** Write one capture block, replacing it in place when it is already there. */
+  function writeCaptureMarkdown(requestId: string, captureId: string, inner: string) {
+    trackCaptureSave(
+      persistCapture(requestId, captureId, inner).then((saved) => {
+        if (saved) clearFailedCapture(requestId, captureId)
+        else recordFailedCapture({ requestId, captureId, inner })
+      }),
+    )
+  }
+
+  function applyCaptureReplacement(id: string, nextInner: string, previous: string, occurrence: number) {
+    const requestId = workspace?.request.request_id
+    if (!requestId) return
+    const rewrite = (body: string) => {
+      const marked = replaceCapture(body, id, nextInner)
+      return marked !== body ? marked : replaceNthBlock(body, previous, nextInner, occurrence)
+    }
+    if (!applyDraftBody(rewrite(draftBody))) return
+    mirrorIntoCookedOriginal(rewrite)
+    trackCaptureSave(
+      saveDraftNow().then((saved) => {
+        if (saved) clearFailedCapture(requestId, id)
+        else recordFailedCapture({ requestId, captureId: id, inner: nextInner })
+      }),
+    )
+  }
+
+  function handleRambleClipPending(requestId: string, clipId: string) {
+    rambleClipsByRequest = {
+      ...rambleClipsByRequest,
+      [requestId]: appendRambleClip(rambleClipsByRequest[requestId] ?? [], '', clipId, true),
+    }
+  }
+
+  function handleRambleClipReady(requestId: string, text: string, clipId?: string) {
+    const clips = rambleClipsByRequest[requestId] ?? []
+    const cleaned = text.trim()
+    if (clipId) {
+      if (!cleaned) {
+        rambleClipsByRequest = {
+          ...rambleClipsByRequest,
+          [requestId]: clips.filter((clip) => clip.id !== clipId),
+        }
+        return
+      }
+      writeCaptureMarkdown(requestId, clipId, capturedTranscriptMarkdown(cleaned))
+      rambleClipsByRequest = {
+        ...rambleClipsByRequest,
+        [requestId]: replaceRambleClip(clips, clipId, cleaned),
+      }
+      return
+    }
+    const nextClips = appendRambleClip(clips, cleaned, `ramble:${crypto.randomUUID()}`)
+    const clip = nextClips[nextClips.length - 1]
+    if (clip) {
+      writeCaptureMarkdown(requestId, clip.id, capturedTranscriptMarkdown(cleaned))
+    }
+    rambleClipsByRequest = {
+      ...rambleClipsByRequest,
+      [requestId]: nextClips,
+    }
+  }
+
+  function handleSaveRambleClip(clipId: string, text: string) {
+    if (!workspace) return
+    const requestId = workspace.request.request_id
+    const clips = rambleClipsByRequest[requestId] ?? []
+    const clipIndex = clips.findIndex((item) => item.id === clipId)
+    const clip = clips[clipIndex]
+    if (!clip) return
+    const next = text.trim()
+    if (!next || next === clip.text) return
+    const markdown = clips.map((item) => capturedTranscriptMarkdown(item.text))
+    applyCaptureReplacement(
+      clip.id,
+      capturedTranscriptMarkdown(next),
+      capturedTranscriptMarkdown(clip.text),
+      sameCaptureOccurrence(markdown, clipIndex),
+    )
+    rambleClipsByRequest = {
+      ...rambleClipsByRequest,
+      [requestId]: replaceRambleClip(clips, clipId, next),
+    }
+  }
+
+  function handleSaveBriefNote(blockId: string, index: number, text: string) {
+    if (!workspace) return
+    const requestId = workspace.request.request_id
+    const notes = briefNotesByRequest[requestId] ?? {}
+    const current = notes[blockId]?.[index]
+    if (current === undefined) return
+    const next = text.trim()
+    if (!next || next === current) return
+    const block = findBriefBlock(
+      briefBlocks({
+        whatHappened: workspace.request.what_happened,
+        actions: workspace.actions,
+        contextRefs: workspace.context_refs,
+      }),
+      blockId,
+    )
+    const inner = block ? quotedNoteMarkdown(block.quote, next) : next
+    const previous = block ? quotedNoteMarkdown(block.quote, current) : current
+    const markdown = (notes[blockId] ?? []).map((item) =>
+      block ? quotedNoteMarkdown(block.quote, item) : item,
+    )
+    applyCaptureReplacement(
+      blockNoteCaptureId(blockId),
+      inner,
+      previous,
+      sameCaptureOccurrence(markdown, index),
+    )
+    briefNotesByRequest = {
+      ...briefNotesByRequest,
+      [requestId]: replaceBlockNote(notes, blockId, index, next),
+    }
+  }
+
+  function handleBriefNoteReady(requestId: string, blockId: string, quote: string, note: string) {
+    const addition = note.trim()
+    if (!addition) return
+    const nextNotes = appendBlockNote(briefNotesByRequest[requestId] ?? {}, blockId, addition)
+    const nextText = nextNotes[blockId]?.[0] ?? addition
+    const inner = quote.trim() ? quotedNoteMarkdown(quote, nextText) : nextText
+    writeCaptureMarkdown(requestId, blockNoteCaptureId(blockId), inner)
+    briefNotesByRequest = {
+      ...briefNotesByRequest,
+      [requestId]: nextNotes,
+    }
+  }
+
   async function importClipboardNow() {
     await rambleController?.importClipboardNow()
   }
@@ -885,6 +1286,11 @@
     bind:rambleRequestId
     bind:rambleRequestTitle
     bind:rambleMessage
+    bind:briefNotePhase
+    bind:briefNoteBlockId
+    bind:briefNoteProcessing
+    bind:briefNoteRequestId
+    bind:voiceNoteTranscript
     interactionLocked={interactionLocked || currentRequestCooking}
     onPageError={(message) => (pageError = message)}
     onSaveDraftNow={saveDraftNow}
@@ -893,6 +1299,9 @@
     onStartScreenCapture={attachmentController.startScreenCapture}
     onImportAttachmentPaths={attachmentController.importAttachmentPaths}
     onAppendRambleMarkdown={appendRambleMarkdown}
+    onRambleClipReady={handleRambleClipReady}
+    onRambleClipPending={handleRambleClipPending}
+    onBriefNoteReady={handleBriefNoteReady}
   />
 
   <AppTitlebar
@@ -991,6 +1400,15 @@
           ramblePhase={rambleBelongsToWorkspace ? ramblePhase : 'idle'}
           rambleBusy={rambleBelongsToWorkspace ? rambleBusy : true}
           rambleStartedOnce={rambleBelongsToWorkspace ? rambleStartedOnce : false}
+          rambleClips={currentRambleClips}
+          briefNotes={currentBriefNotes}
+          briefNotePhase={currentNotePhase}
+          briefNoteBlockId={currentNoteBlockId}
+          briefNoteProcessingIds={currentNoteProcessingIds}
+          noteTranscript={briefNoteBelongsToWorkspace ? voiceNoteTranscript : ''}
+          onToggleBriefNote={(blockId) => void toggleBriefNote(blockId)}
+          onSaveRambleClip={handleSaveRambleClip}
+          onSaveBriefNote={handleSaveBriefNote}
           voiceDevice={rambleBelongsToWorkspace ? voiceDevice : ''}
           voiceChunkIndex={rambleBelongsToWorkspace ? voiceChunkIndex : 0}
           voicePartial={rambleBelongsToWorkspace ? voicePartial : ''}
@@ -1011,6 +1429,8 @@
           {canCancel}
           {cancelling}
           {approving}
+          noteBusy={currentNotePhase === 'starting' || captureInFlight || terminalPending}
+          {terminalPending}
           {canOpenResumePrompt}
           {resolveHostProfile}
           formatTime={formatTimeLocal}
