@@ -28,6 +28,13 @@ type PublisherControllerContext = {
   getCanSubmit: () => boolean
   getRambleCanExit: () => boolean
   exitRamble: () => Promise<void>
+  /** Resolves false when a capture failed to persist; publishing must then stop. */
+  awaitCaptureWork: () => Promise<boolean>
+  /** False while another terminal operation is already draining. */
+  canStartTerminal: () => boolean
+  /** Counted lock that refuses new recordings, navigation and editing. */
+  lockTerminal: () => void
+  unlockTerminal: () => void
   saveDraftNow: () => Promise<boolean>
   getDraftBody: () => string
   getSavedRevision: () => number
@@ -104,10 +111,31 @@ export function createPublisherController(context: PublisherControllerContext) {
     await context.refreshNavigation(true)
   }
 
+  /**
+   * Hold the terminal lock for the whole submission, not just the capture
+   * drain. Releasing it when the drain returned left the save and the
+   * revalidation exposed: a recording started in that window is not in the
+   * chain that was drained, and publishing would strand its transcript.
+   */
   async function submitFeedback() {
+    // Checked before taking the lock, never after: once held, this operation's
+    // own lock is part of what canSubmit reports on.
+    if (!context.canStartTerminal()) return
+    context.lockTerminal()
+    try {
+      await runSubmitFeedback()
+    } finally {
+      context.unlockTerminal()
+    }
+  }
+
+  async function runSubmitFeedback() {
     const workspace = context.getWorkspace()
     if (!workspace || !context.getCanSubmit()) return
     if (context.getRambleCanExit()) await context.exitRamble()
+    // Publishing is terminal for the draft, so speech still being transcribed
+    // has to land first — exitRamble only covers it while Ramble is engaged.
+    if (!(await context.awaitCaptureWork())) return
     const requestId = workspace.request.request_id
     if (!(await context.saveDraftNow())) return
     if (

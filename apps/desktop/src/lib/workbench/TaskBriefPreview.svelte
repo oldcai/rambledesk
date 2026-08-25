@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileImage, FileText, Paperclip, Pause, Play } from '@lucide/svelte'
+  import { FileImage, FileText, LoaderCircle, Mic, Paperclip } from '@lucide/svelte'
 
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
@@ -10,13 +10,22 @@
     type FeedbackWorkspaceView,
     type RequestAttachmentView,
   } from '$lib/feedback'
+  import { playClipRackSound } from '$lib/notifications'
   import { t } from '$lib/i18n'
-  import { locale } from '$lib/preferences'
+  import { locale, notificationVolume } from '$lib/preferences'
   import LinkifiedText from '$lib/LinkifiedText.svelte'
   import { isSafeHttpUrl } from '$lib/linkify'
   import { openExternalUrl } from '$lib/openExternalUrl'
+  import {
+    briefBlocks,
+    isCaptureTooltipEvent,
+    type ClipFlyFrom,
+    type RambleClip,
+  } from './briefNotes'
+  import BriefNoteBlock from './BriefNoteBlock.svelte'
+  import RambleClipIcon from './RambleClipIcon.svelte'
   import RequestAttachmentPreview from './RequestAttachmentPreview.svelte'
-  import type { HostProfile, RamblePhase } from './types'
+  import type { BriefNotePhase, HostProfile, RamblePhase } from './types'
 
   export let open = false
   export let workspace: FeedbackWorkspaceView | null = null
@@ -32,15 +41,36 @@
   export let ramblePhase: RamblePhase = 'idle'
   export let rambleStartedOnce = false
   export let rambleBusy = false
+  export let rambleClips: RambleClip[] = []
+  export let briefNotes: Record<string, string[]> = {}
+  export let briefNotePhase: BriefNotePhase = 'idle'
+  export let briefNoteBlockId: string | null = null
+  export let briefNoteProcessingIds: string[] = []
+  /** Everything spoken into the note being recorded, stable segments included. */
+  export let noteTranscript = ''
+  export let onToggleBriefNote: (blockId: string) => void = () => {}
+  export let onSaveRambleClip: (clipId: string, text: string) => void = () => {}
+  export let onSaveBriefNote: (blockId: string, index: number, text: string) => void = () => {}
   /** CSS transform-origin the dialog should shrink toward when closing. */
   export let origin: string | null = null
 
   let attachmentPreviewOpen = false
   let attachmentPreview: RequestAttachmentView | null = null
+  let recordButtonEl: HTMLElement | null = null
+  let flyingClipId: string | null = null
+  let flyFrom: ClipFlyFrom | null = null
+  let seenClipCount = 0
+  let hydratedRequestId: string | null = null
+
+  export let interactionLocked = false
 
   $: rambleActive = ramblePhase === 'active'
+  // Cooking, submitting, cancelling and approving all refuse draft writes, so a
+  // tooltip edit made during one is silently swallowed when the operation's own
+  // result lands. Present the captures as read-only instead of losing the edit.
   $: readOnly =
     workspace === null ||
+    interactionLocked ||
     workspace.request.status === 'completed' ||
     workspace.request.status === 'cancelled'
 
@@ -67,12 +97,45 @@
     ramblePhase === 'starting'
       ? tr('Starting…')
       : ramblePhase === 'stopping'
-        ? tr('Pausing…')
+        ? tr('Writing speech into the document…')
         : rambleActive
-          ? tr('Pause Ramble')
+          ? tr('Recording')
           : rambleStartedOnce
             ? tr('Resume Ramble')
             : tr('Start Ramble')
+  $: noteRecording = briefNotePhase === 'recording'
+  $: noteStarting = briefNotePhase === 'starting'
+  $: blocks = workspace
+    ? briefBlocks({
+        whatHappened: workspace.request.what_happened,
+        actions: workspace.actions,
+        contextRefs: workspace.context_refs,
+      })
+    : []
+  $: whatHappenedBlocks = blocks.filter((block) => block.kind === 'what_happened')
+  $: rambleButtonDisabled = rambleBusy || noteRecording || noteStarting
+  $: {
+    const requestId = workspace?.request.request_id ?? null
+    if (requestId !== hydratedRequestId) {
+      hydratedRequestId = requestId
+      seenClipCount = rambleClips.length
+      flyingClipId = null
+      flyFrom = null
+    } else if (rambleClips.length > seenClipCount) {
+      const newest = rambleClips[rambleClips.length - 1]
+      const rect = recordButtonEl?.getBoundingClientRect()
+      flyFrom = rect
+        ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+        : null
+      flyingClipId = newest.id
+      seenClipCount = rambleClips.length
+      void playClipRackSound($notificationVolume)
+    } else if (rambleClips.length < seenClipCount) {
+      seenClipCount = rambleClips.length
+      flyingClipId = null
+      flyFrom = null
+    }
+  }
 
   function openAttachment(attachment: RequestAttachmentView) {
     attachmentPreview = attachment
@@ -82,6 +145,12 @@
 
 <Dialog.Root bind:open>
   <Dialog.Content
+    onInteractOutside={(event) => {
+      if (isCaptureTooltipEvent(event.target)) event.preventDefault()
+    }}
+    onFocusOutside={(event) => {
+      if (isCaptureTooltipEvent(event.target)) event.preventDefault()
+    }}
     class="task-brief-preview-content grid h-[calc(100vh-2rem)] w-[min(1200px,calc(100vw-2rem))] max-w-[min(1200px,calc(100vw-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 duration-200 sm:max-w-[min(1200px,calc(100vw-2rem))]"
     style={origin ? `transform-origin: ${origin}` : undefined}
   >
@@ -114,9 +183,25 @@
             <h2 class="m-0 border-b border-border pb-2 text-base font-semibold">
               {tr('What happened')}
             </h2>
-            <p class="m-0 mt-4 whitespace-pre-wrap text-[15px] leading-7">
-              <LinkifiedText text={workspace.request.what_happened} />
-            </p>
+            <div class="mt-4 grid gap-3">
+              {#each whatHappenedBlocks as block (block.id)}
+                <BriefNoteBlock
+                  notes={briefNotes[block.id] ?? []}
+                  recording={noteRecording && briefNoteBlockId === block.id}
+                  processing={briefNoteProcessingIds.includes(block.id) ||
+                    (noteStarting && briefNoteBlockId === block.id)}
+                  disabled={readOnly || rambleActive || rambleBusy}
+                  {readOnly}
+                  partial={briefNoteBlockId === block.id ? noteTranscript : ''}
+                  onToggleRecord={() => onToggleBriefNote(block.id)}
+                  onSaveNote={(index, text) => onSaveBriefNote(block.id, index, text)}
+                >
+                  <p class="m-0 whitespace-pre-wrap text-[15px] leading-7">
+                    <LinkifiedText text={block.quote} />
+                  </p>
+                </BriefNoteBlock>
+              {/each}
+            </div>
           </section>
 
           <section class="mt-8">
@@ -131,9 +216,21 @@
                   >
                     {index + 1}
                   </span>
-                  <span class="min-w-0 self-center text-[15px] leading-7">
-                    <LinkifiedText text={action.instruction} />
-                  </span>
+                  <BriefNoteBlock
+                    notes={briefNotes[`action:${action.id}`] ?? []}
+                    recording={noteRecording && briefNoteBlockId === `action:${action.id}`}
+                    processing={briefNoteProcessingIds.includes(`action:${action.id}`) ||
+                      (noteStarting && briefNoteBlockId === `action:${action.id}`)}
+                    disabled={readOnly || rambleActive || rambleBusy}
+                    {readOnly}
+                    partial={briefNoteBlockId === `action:${action.id}` ? noteTranscript : ''}
+                    onToggleRecord={() => onToggleBriefNote(`action:${action.id}`)}
+                    onSaveNote={(index, text) => onSaveBriefNote(`action:${action.id}`, index, text)}
+                  >
+                    <span class="min-w-0 self-center text-[15px] leading-7">
+                      <LinkifiedText text={action.instruction} />
+                    </span>
+                  </BriefNoteBlock>
                 </li>
               {/each}
             </ol>
@@ -152,28 +249,40 @@
                     >
                       {index + 1}
                     </span>
-                    <div class="min-w-0">
-                      <strong class="block text-[15px] font-medium leading-6">{ref.label}</strong>
-                      {#if isSafeHttpUrl(ref.uri)}
-                        <a
-                          href={ref.uri}
-                          class="block break-all text-sm leading-6 text-primary underline underline-offset-2"
-                          rel="noreferrer"
-                          onclick={(event) => {
-                            event.preventDefault()
-                            void openExternalUrl(ref.uri).catch((cause) => {
-                              console.warn('Could not open external URL', cause)
-                            })
-                          }}
-                        >
-                          {ref.uri}
-                        </a>
-                      {:else}
-                        <span class="block break-all text-sm leading-6 text-muted-foreground">
-                          {ref.uri}
-                        </span>
-                      {/if}
-                    </div>
+                    <BriefNoteBlock
+                      notes={briefNotes[`context:${index}`] ?? []}
+                      recording={noteRecording && briefNoteBlockId === `context:${index}`}
+                      processing={briefNoteProcessingIds.includes(`context:${index}`) ||
+                        (noteStarting && briefNoteBlockId === `context:${index}`)}
+                      disabled={readOnly || rambleActive || rambleBusy}
+                      {readOnly}
+                      partial={briefNoteBlockId === `context:${index}` ? noteTranscript : ''}
+                      onToggleRecord={() => onToggleBriefNote(`context:${index}`)}
+                      onSaveNote={(index, text) => onSaveBriefNote(`context:${index}`, index, text)}
+                    >
+                      <div class="min-w-0">
+                        <strong class="block text-[15px] font-medium leading-6">{ref.label}</strong>
+                        {#if isSafeHttpUrl(ref.uri)}
+                          <a
+                            href={ref.uri}
+                            class="block break-all text-sm leading-6 text-primary underline underline-offset-2"
+                            rel="noreferrer"
+                            onclick={(event) => {
+                              event.preventDefault()
+                              void openExternalUrl(ref.uri).catch((cause) => {
+                                console.warn('Could not open external URL', cause)
+                              })
+                            }}
+                          >
+                            {ref.uri}
+                          </a>
+                        {:else}
+                          <span class="block break-all text-sm leading-6 text-muted-foreground">
+                            {ref.uri}
+                          </span>
+                        {/if}
+                      </div>
+                    </BriefNoteBlock>
                   </li>
                 {/each}
               </ul>
@@ -226,16 +335,45 @@
     </div>
 
     {#if workspace && !readOnly}
-      <div class="flex shrink-0 items-center justify-end gap-2 border-t bg-background px-6 py-3">
+      <div class="flex shrink-0 items-center gap-3 border-t bg-background px-6 py-3">
+        <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
+          {#each rambleClips as clip, index (clip.id)}
+            <RambleClipIcon
+              index={index + 1}
+              text={clip.text}
+              flyFrom={clip.id === flyingClipId ? flyFrom : null}
+              processing={Boolean(clip.processing)}
+              {readOnly}
+              onSave={(text) => onSaveRambleClip(clip.id, text)}
+            />
+          {/each}
+          {#if ramblePhase === 'stopping' && !rambleClips.some((clip) => clip.processing)}
+            <span class="grid size-8 place-items-center text-muted-foreground" aria-label={rambleLabel}>
+              <LoaderCircle class="size-4 animate-spin" />
+            </span>
+          {:else if rambleActive}
+            <span
+              class="record-blink size-2.5 shrink-0 rounded-full bg-destructive"
+              aria-hidden="true"
+            ></span>
+          {/if}
+        </div>
         <Button
-          variant={rambleActive ? 'secondary' : 'default'}
-          disabled={rambleBusy}
+          bind:ref={recordButtonEl}
+          variant={rambleActive ? 'destructive' : 'default'}
+          disabled={rambleButtonDisabled}
           onclick={onToggleRamble}
+          aria-pressed={rambleActive}
         >
-          {#if rambleActive}
-            <Pause data-icon="inline-start" />
+          {#if ramblePhase === 'starting' || ramblePhase === 'stopping'}
+            <LoaderCircle class="animate-spin" data-icon="inline-start" />
+          {:else if rambleActive}
+            <span
+              class="record-blink size-2.5 rounded-full bg-destructive"
+              data-icon="inline-start"
+            ></span>
           {:else}
-            <Play data-icon="inline-start" />
+            <Mic data-icon="inline-start" />
           {/if}
           {rambleLabel}
         </Button>

@@ -3,6 +3,7 @@ import type { AttachmentView } from '../feedback'
 export type SavePhase = 'idle' | 'unsaved' | 'saving' | 'saved' | 'error'
 export type RamblePhase = 'idle' | 'starting' | 'active' | 'paused' | 'stopping' | 'error'
 export type VoicePhase = 'idle' | 'starting' | 'listening' | 'processing' | 'stopping' | 'error'
+export type BriefNotePhase = 'idle' | 'starting' | 'recording' | 'error'
 export type SubmitStage = 'idle' | 'cooking' | 'publishing'
 export type SettingsSection = 'general' | 'notifications' | 'voice' | 'adapters' | 'about'
 
@@ -35,7 +36,12 @@ export type FeedbackEditorHandle = {
 
 export type RambleSessionControllerHandle = {
   toggleRamble(): Promise<void>
+  toggleBriefNote(blockId: string): Promise<void>
   exitRamble(): Promise<void>
+  awaitCaptureWork(): Promise<void>
+  awaitPendingCaptures(): Promise<void>
+  lockCaptureEntry(): void
+  unlockCaptureEntry(): void
   importClipboardNow(): Promise<void>
   resetVoiceUi(): void
   resetRambleUi(): void

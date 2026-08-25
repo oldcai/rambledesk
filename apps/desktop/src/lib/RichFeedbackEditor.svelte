@@ -202,12 +202,19 @@
   }
 
   export function appendTranscript(text: string) {
-    const transcript = text.trim()
-    if (!editor || !transcript || disabled) return
-    editor.commands.insertContentAt(editor.state.doc.content.size, {
-      type: 'paragraph',
-      content: [{ type: 'text', text: transcript }],
-    })
+    const parts = text
+      .trim()
+      .split(/\n+/)
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0)
+    if (!editor || parts.length === 0 || disabled) return
+    editor.commands.insertContentAt(
+      editor.state.doc.content.size,
+      parts.map((part) => ({
+        type: 'paragraph',
+        content: [{ type: 'text', text: part }],
+      })),
+    )
   }
 
   export function appendClipboardCapture(text: string, label: string) {
